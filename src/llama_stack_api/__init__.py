@@ -527,6 +527,7 @@ from .version import (
     LLAMA_STACK_API_V1BETA,
 )
 from . import common  # noqa: F401
+from .provider_plugin import ProviderPlugin
 
 
 __all__ = [
@@ -875,6 +876,7 @@ __all__ = [
     "UpdatePromptBodyRequest",
     "UpdatePromptRequest",
     "ProviderInfo",
+    "ProviderPlugin",
     "ProviderSpec",
     "Providers",
     "python_type_to_name",

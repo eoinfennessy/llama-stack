@@ -13,7 +13,7 @@ llama-stack-api = { workspace = true }
 [project]
 name = "efenness-llama-stack-provider-inference-ollama"
 dynamic = ["version"]
-description = "Ollama inference provider for Llama Stack"
+description = "Ollama inference provider for running local models through the Ollama runtime."
 requires-python = ">=3.12"
 license = "MIT"
 dependencies = [
@@ -25,7 +25,7 @@ dependencies = [
 ]
 
 [project.entry-points."llama_stack.providers"]
-"inference.remote.ollama" = "llama_stack_provider_inference_ollama.provider:get_provider_spec"
+"inference.remote.ollama" = "llama_stack_provider_inference_ollama.plugin:OllamaPlugin"
 
 [tool.setuptools.packages.find]
 where = ["src"]

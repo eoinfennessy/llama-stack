@@ -19,12 +19,16 @@ from llama_stack.log import get_logger
 from llama_stack_api import (
     Api,
     InlineProviderSpec,
+    ProviderPlugin,
     ProviderSpec,
     RemoteProviderSpec,
 )
 
 logger = get_logger(name=__name__, category="core")
 
+# Maps provider_type -> ProviderPlugin subclass for plugin-based providers.
+# Populated by _discover_providers_from_entry_points(), read by the resolver.
+plugin_registry: dict[str, type[ProviderPlugin]] = {}
 
 INTERNAL_APIS = {Api.inspect, Api.providers, Api.prompts, Api.conversations, Api.connectors, Api.admin}
 
@@ -91,13 +95,67 @@ def _load_inline_provider_spec(spec_data: dict[str, Any], api: Api, provider_nam
     return spec
 
 
+def _spec_from_plugin_class(
+    ep_name: str,
+    plugin_cls: type[ProviderPlugin],
+    description: str,
+    package_name: str,
+) -> ProviderSpec:
+    """Create a ProviderSpec from a ProviderPlugin subclass and entry point metadata.
+
+    The entry point name encodes api and provider type:
+        "inference.remote.ollama" -> Api.inference, "remote::ollama"
+
+    The package_name is included in pip_packages so that list-deps can emit it
+    for container builds until that mechanism is replaced.
+    """
+    parts = ep_name.split(".")
+    api = Api[parts[0]]
+    protocol = parts[1]
+    provider_name = parts[2]
+    provider_type = f"{protocol}::{provider_name}"
+
+    config_cls = plugin_cls.config_class
+    config_class_fqn = f"{config_cls.__module__}.{config_cls.__qualname__}"
+    module_path = plugin_cls.__module__.rsplit(".", 1)[0]
+
+    required_apis, optional_apis = plugin_cls.get_dependencies()
+    pip_packages = [package_name] if package_name else []
+
+    plugin_registry[provider_type] = plugin_cls
+
+    if protocol == "remote":
+        return RemoteProviderSpec(
+            api=api,
+            adapter_type=provider_name,
+            provider_type=provider_type,
+            config_class=config_class_fqn,
+            module=module_path,
+            api_dependencies=required_apis,
+            optional_api_dependencies=optional_apis,
+            pip_packages=pip_packages,
+            description=description,
+        )
+    return InlineProviderSpec(
+        api=api,
+        provider_type=provider_type,
+        config_class=config_class_fqn,
+        module=module_path,
+        api_dependencies=required_apis,
+        optional_api_dependencies=optional_apis,
+        pip_packages=pip_packages,
+        description=description,
+    )
+
+
 def _discover_providers_from_entry_points(
     registry: dict[Api, dict[str, ProviderSpec]],
 ) -> dict[Api, dict[str, ProviderSpec]]:
     """Discover providers registered via Python entry points.
 
-    Entry points in the 'llama_stack.providers' group are expected to be
-    callables that return a ProviderSpec or list[ProviderSpec].
+    Entry points in the 'llama_stack.providers' group can be either:
+    - A ProviderPlugin subclass (new style): metadata is inferred from the class
+    - A callable returning ProviderSpec or list[ProviderSpec] (legacy)
 
     Providers already in the registry (e.g. from registry files) take
     precedence and will not be overwritten.
@@ -105,9 +163,19 @@ def _discover_providers_from_entry_points(
     eps = importlib.metadata.entry_points(group="llama_stack.providers")
     for ep in eps:
         try:
-            get_spec = ep.load()
-            spec_or_specs = get_spec()
-            specs = spec_or_specs if isinstance(spec_or_specs, list) else [spec_or_specs]
+            loaded = ep.load()
+
+            if isinstance(loaded, type) and issubclass(loaded, ProviderPlugin):
+                description = ""
+                package_name = ""
+                if ep.dist is not None:
+                    description = ep.dist.metadata.get("Summary", "")
+                    package_name = ep.dist.metadata.get("Name", "")
+                specs = [_spec_from_plugin_class(ep.name, loaded, description, package_name)]
+            else:
+                spec_or_specs = loaded()
+                specs = spec_or_specs if isinstance(spec_or_specs, list) else [spec_or_specs]
+
             for spec in specs:
                 if spec.api not in registry:
                     registry[spec.api] = {}

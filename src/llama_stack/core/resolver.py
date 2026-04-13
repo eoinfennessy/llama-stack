@@ -17,7 +17,7 @@ from llama_stack.core.datatypes import (
     RoutingTableProviderSpec,
     StackConfig,
 )
-from llama_stack.core.distribution import builtin_automatically_routed_apis
+from llama_stack.core.distribution import builtin_automatically_routed_apis, plugin_registry
 from llama_stack.core.external import load_external_apis
 from llama_stack.core.store import DistributionRegistry
 from llama_stack.core.utils.dynamic import instantiate_class_type
@@ -39,6 +39,7 @@ from llama_stack_api import (
     Models,
     ModelsProtocolPrivate,
     Prompts,
+    ProviderPlugin,
     ProviderSpec,
     RemoteProviderConfig,
     RemoteProviderSpec,
@@ -380,6 +381,44 @@ def topological_sort(
     return flattened
 
 
+async def _instantiate_plugin_provider(
+    plugin_cls: type[ProviderPlugin],
+    provider: ProviderWithSpec,
+    deps: dict[Api, Any],
+    run_config: StackConfig,
+) -> Any:
+    """Instantiate a provider via its ProviderPlugin subclass."""
+    config = plugin_cls.config_class(**provider.config)
+    plugin = plugin_cls(config)
+
+    logger.debug("Instantiating provider via plugin", provider_id=provider.provider_id, plugin=plugin_cls.__name__)
+
+    dep_kwargs: dict[str, Any] = {}
+    required_apis, optional_apis = plugin_cls.get_dependencies()
+    for api in required_apis:
+        dep_kwargs[api.name] = deps[api]
+    for api in optional_apis:
+        if api in deps:
+            dep_kwargs[api.name] = deps[api]
+
+    impl = plugin.create(**dep_kwargs)
+    if hasattr(impl, "initialize"):
+        await impl.initialize()
+
+    object.__setattr__(impl, "__provider_id__", provider.provider_id)
+    object.__setattr__(impl, "__provider_spec__", provider.spec)
+    object.__setattr__(impl, "__provider_config__", config)
+
+    protocols = api_protocol_map_for_compliance_check(run_config)
+    additional_protocols = additional_protocols_map()
+    check_protocol_compliance(impl, protocols[provider.spec.api])
+    if provider.spec.api in additional_protocols:
+        additional_api, _, _ = additional_protocols[provider.spec.api]
+        check_protocol_compliance(impl, additional_api)
+
+    return impl
+
+
 async def instantiate_provider(
     provider: ProviderWithSpec,
     deps: dict[Api, Any],
@@ -402,6 +441,13 @@ async def instantiate_provider(
         The instantiated provider implementation.
     """
     provider_spec = provider.spec
+
+    # ProviderPlugin path: type-safe instantiation without string-based imports
+    plugin_cls = plugin_registry.get(provider_spec.provider_type)
+    if plugin_cls is not None:
+        return await _instantiate_plugin_provider(plugin_cls, provider, deps, run_config)
+
+    # Legacy ProviderSpec path: string-based module/config_class imports
     if not hasattr(provider_spec, "module") or provider_spec.module is None:
         raise AttributeError(f"ProviderSpec of type {type(provider_spec)} does not have a 'module' attribute")
 
