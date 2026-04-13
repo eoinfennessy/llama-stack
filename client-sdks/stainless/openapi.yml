@@ -13017,6 +13017,7 @@ components:
           title: Provider Type
           type: string
         config_class:
+          default: ''
           description: Fully-qualified classname of the config for this provider
           title: Config Class
           type: string
@@ -13086,7 +13087,6 @@ components:
       required:
       - api
       - provider_type
-      - config_class
       title: ProviderSpec
     InlineProviderSpec:
       description: Provider specification for inline (built-in) providers with optional container support.
@@ -13097,6 +13097,7 @@ components:
           title: Provider Type
           type: string
         config_class:
+          default: ''
           description: Fully-qualified classname of the config for this provider
           title: Config Class
           type: string
@@ -13183,7 +13184,6 @@ components:
       required:
       - api
       - provider_type
-      - config_class
       title: InlineProviderSpec
     RemoteProviderSpec:
       description: Provider specification for remote providers accessed via an adapter.
@@ -13194,6 +13194,7 @@ components:
           title: Provider Type
           type: string
         config_class:
+          default: ''
           description: Fully-qualified classname of the config for this provider
           title: Config Class
           type: string
@@ -13275,7 +13276,6 @@ components:
       required:
       - api
       - provider_type
-      - config_class
       - adapter_type
       title: RemoteProviderSpec
     ListRoutesRequest:

@@ -237,7 +237,7 @@ class ProviderSpec(BaseModel):
     api: Api
     provider_type: str
     config_class: str = Field(
-        ...,
+        default="",
         description="Fully-qualified classname of the config for this provider",
     )
     api_dependencies: list[Api] = Field(

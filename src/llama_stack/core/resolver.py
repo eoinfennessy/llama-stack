@@ -5,22 +5,17 @@
 # the root directory of this source tree.
 
 import importlib
-import importlib.metadata
 import inspect
 from typing import Any
 
 from llama_stack.core.client import get_client_impl
 from llama_stack.core.datatypes import (
     AccessRule,
-    AutoRoutedProviderSpec,
     Provider,
-    RoutingTableProviderSpec,
     StackConfig,
 )
 from llama_stack.core.distribution import builtin_automatically_routed_apis, plugin_registry
 from llama_stack.core.external import load_external_apis
-from llama_stack.core.store import DistributionRegistry
-from llama_stack.core.utils.dynamic import instantiate_class_type
 from llama_stack.log import get_logger
 from llama_stack_api import (
     LLAMA_STACK_API_V1ALPHA,
@@ -39,10 +34,8 @@ from llama_stack_api import (
     Models,
     ModelsProtocolPrivate,
     Prompts,
-    ProviderPlugin,
     ProviderSpec,
     RemoteProviderConfig,
-    RemoteProviderSpec,
     Responses,
     Safety,
     Shields,
@@ -152,246 +145,116 @@ ProviderRegistry = dict[Api, dict[str, ProviderSpec]]
 async def resolve_impls(
     run_config: StackConfig,
     provider_registry: ProviderRegistry,
-    dist_registry: DistributionRegistry,
+    dist_registry: Any,
     policy: list[AccessRule],
     internal_impls: dict[Api, Any] | None = None,
 ) -> dict[Api, Any]:
+    """Resolve and instantiate all provider implementations.
+
+    Two-phase approach:
+    1. Instantiate all user-facing providers (remote/inline) via ProviderPlugin
+    2. Wire up routing infrastructure (routing tables + auto-routers) directly
     """
-    Resolves provider implementations by:
-    1. Validating and organizing providers.
-    2. Sorting them in dependency order.
-    3. Instantiating them with required dependencies.
-    """
-    routing_table_apis = {x.routing_table_api for x in builtin_automatically_routed_apis()}
-    router_apis = {x.router_api for x in builtin_automatically_routed_apis()}
-
-    providers_with_specs = validate_and_prepare_providers(
-        run_config, provider_registry, routing_table_apis, router_apis
-    )
-
-    apis_to_serve = run_config.apis or set(
-        list(providers_with_specs.keys()) + [x.value for x in routing_table_apis] + [x.value for x in router_apis]
-    )
-
-    providers_with_specs.update(specs_for_autorouted_apis(apis_to_serve))
-
-    sorted_providers = sort_providers_by_deps(providers_with_specs, run_config)
-
-    return await instantiate_providers(sorted_providers, router_apis, dist_registry, run_config, policy, internal_impls)
-
-
-def specs_for_autorouted_apis(apis_to_serve: list[str] | set[str]) -> dict[str, dict[str, ProviderWithSpec]]:
-    """Generates specifications for automatically routed APIs."""
-    specs = {}
-    for info in builtin_automatically_routed_apis():
-        if info.router_api.value not in apis_to_serve:
-            continue
-
-        specs[info.routing_table_api.value] = {
-            "__builtin__": ProviderWithSpec(
-                provider_id="__routing_table__",
-                provider_type="__routing_table__",
-                config={},
-                spec=RoutingTableProviderSpec(
-                    api=info.routing_table_api,
-                    router_api=info.router_api,
-                    module="llama_stack.core.routers",
-                    api_dependencies=[],
-                    deps__=[f"inner-{info.router_api.value}"],
-                ),
-            )
-        }
-
-        # Add inference as an optional dependency for vector_io to enable query rewriting
-        optional_deps = []
-        deps_list = [info.routing_table_api.value]
-        if info.router_api == Api.vector_io:
-            optional_deps = [Api.inference]
-            deps_list.append(Api.inference.value)
-
-        specs[info.router_api.value] = {
-            "__builtin__": ProviderWithSpec(
-                provider_id="__autorouted__",
-                provider_type="__autorouted__",
-                config={},
-                spec=AutoRoutedProviderSpec(
-                    api=info.router_api,
-                    module="llama_stack.core.routers",
-                    routing_table_api=info.routing_table_api,
-                    api_dependencies=[info.routing_table_api],
-                    optional_api_dependencies=optional_deps,
-                    deps__=deps_list,
-                ),
-            )
-        }
-    return specs
-
-
-def validate_and_prepare_providers(
-    run_config: StackConfig, provider_registry: ProviderRegistry, routing_table_apis: set[Api], router_apis: set[Api]
-) -> dict[str, dict[str, ProviderWithSpec]]:
-    """Validates providers, handles deprecations, and organizes them into a spec dictionary."""
-    providers_with_specs: dict[str, dict[str, ProviderWithSpec]] = {}
-
-    for api_str, providers in run_config.providers.items():
-        api = Api(api_str)
-        if api in routing_table_apis:
-            raise ValueError(f"Provider for `{api_str}` is automatically provided and cannot be overridden")
-
-        specs = {}
-        for provider in providers:
-            if not provider.provider_id or provider.provider_id == "__disabled__":
-                logger.debug("Provider is disabled", provider_type=provider.provider_type, api=str(api))
-                continue
-
-            validate_provider(provider, api, provider_registry)
-            p = provider_registry[api][provider.provider_type]
-            p.deps__ = [a.value for a in p.api_dependencies] + [a.value for a in p.optional_api_dependencies]
-            spec = ProviderWithSpec(spec=p, **provider.model_dump())
-            specs[provider.provider_id] = spec
-
-        key = api_str if api not in router_apis else f"inner-{api_str}"
-        providers_with_specs[key] = specs
-
-    return providers_with_specs
-
-
-def validate_provider(provider: Provider, api: Api, provider_registry: ProviderRegistry):
-    """Validates if the provider is allowed and handles deprecations."""
-    if provider.provider_type not in provider_registry[api]:
-        raise ValueError(f"Provider `{provider.provider_type}` is not available for API `{api}`")
-
-    p = provider_registry[api][provider.provider_type]
-    if p.deprecation_error:
-        logger.error(p.deprecation_error)
-        raise InvalidProviderError(p.deprecation_error)
-    elif p.deprecation_warning:
-        logger.warning(
-            "Provider is deprecated and will be removed in a future release",
-            provider_type=provider.provider_type,
-            api=str(api),
-            deprecation=p.deprecation_warning,
-        )
-
-
-def sort_providers_by_deps(
-    providers_with_specs: dict[str, dict[str, ProviderWithSpec]], run_config: StackConfig
-) -> list[tuple[str, ProviderWithSpec]]:
-    """Sorts providers based on their dependencies."""
-    sorted_providers: list[tuple[str, ProviderWithSpec]] = topological_sort(
-        {k: list(v.values()) for k, v in providers_with_specs.items()}
-    )
-
-    logger.debug("Resolved providers", count=len(sorted_providers))
-    for api_str, provider in sorted_providers:
-        logger.debug("Provider mapping", api=api_str, provider_id=provider.provider_id)
-    return sorted_providers
-
-
-async def instantiate_providers(
-    sorted_providers: list[tuple[str, ProviderWithSpec]],
-    router_apis: set[Api],
-    dist_registry: DistributionRegistry,
-    run_config: StackConfig,
-    policy: list[AccessRule],
-    internal_impls: dict[Api, Any] | None = None,
-) -> dict[Api, Any]:
-    """Instantiates providers asynchronously while managing dependencies."""
     impls: dict[Api, Any] = internal_impls.copy() if internal_impls else {}
-    inner_impls_by_provider_id: dict[str, dict[str, Any]] = {f"inner-{x.value}": {} for x in router_apis}
-    for api_str, provider in sorted_providers:
-        # Skip providers that are not enabled
-        if provider.provider_id is None:
-            continue
 
-        try:
-            deps = {a: impls[a] for a in provider.spec.api_dependencies}
-        except KeyError as e:
-            missing_api = e.args[0]
-            raise RuntimeError(
-                f"Failed to resolve '{provider.spec.api.value}' provider '{provider.provider_id}' of type '{provider.spec.provider_type}': "
-                f"required dependency '{missing_api.value}' is not available. "
-                f"Please add a '{missing_api.value}' provider to your configuration or check if the provider is properly configured."
-            ) from e
-        for a in provider.spec.optional_api_dependencies:
-            if a in impls:
-                deps[a] = impls[a]
+    # Phase 1: Instantiate user-facing providers in dependency order
+    sorted_providers = _prepare_and_sort_providers(run_config, provider_registry)
+    for provider in sorted_providers:
+        deps = _resolve_deps(provider, impls)
+        impl = await _instantiate_provider(provider, deps, run_config)
+        impls[provider.spec.api] = impl
 
-        inner_impls = {}
-        if isinstance(provider.spec, RoutingTableProviderSpec):
-            inner_impls = inner_impls_by_provider_id[f"inner-{provider.spec.router_api.value}"]
-
-        impl = await instantiate_provider(provider, deps, inner_impls, dist_registry, run_config, policy)
-
-        if api_str.startswith("inner-"):
-            inner_impls_by_provider_id[api_str][provider.provider_id] = impl
-        else:
-            api = Api(api_str)
-            impls[api] = impl
-
-    # Post-instantiation: Inject VectorIORouter into VectorStoresRoutingTable
-    if Api.vector_io in impls and Api.vector_stores in impls:
-        vector_io_router = impls[Api.vector_io]
-        vector_stores_routing_table = impls[Api.vector_stores]
-        if hasattr(vector_stores_routing_table, "vector_io_router"):
-            vector_stores_routing_table.vector_io_router = vector_io_router
+    # Phase 2: Wire up routing infrastructure
+    await _wire_routing(impls, dist_registry, run_config, policy)
 
     return impls
 
 
-def topological_sort(
-    providers_with_specs: dict[str, list[ProviderWithSpec]],
-) -> list[tuple[str, ProviderWithSpec]]:
-    """Sort providers in dependency order using topological sort.
+def _prepare_and_sort_providers(
+    run_config: StackConfig,
+    provider_registry: ProviderRegistry,
+) -> list[ProviderWithSpec]:
+    """Validate, resolve specs, and sort providers in dependency order."""
+    providers: list[ProviderWithSpec] = []
 
-    Args:
-        providers_with_specs: Dictionary mapping API names to their providers with specs.
+    for api_str, configured_providers in run_config.providers.items():
+        api = Api(api_str)
+        for provider in configured_providers:
+            if not provider.provider_id or provider.provider_id == "__disabled__":
+                continue
 
-    Returns:
-        A flattened list of (api_name, provider) tuples in dependency order.
-    """
+            if provider.provider_type not in provider_registry.get(api, {}):
+                raise ValueError(f"Provider `{provider.provider_type}` is not available for API `{api}`")
 
-    def dfs(kv, visited: set[str], stack: list[str]):
-        api_str, providers = kv
-        visited.add(api_str)
+            spec = provider_registry[api][provider.provider_type]
+            if spec.deprecation_error:
+                raise InvalidProviderError(spec.deprecation_error)
+            if spec.deprecation_warning:
+                logger.warning(
+                    "Provider is deprecated",
+                    provider_type=provider.provider_type,
+                    warning=spec.deprecation_warning,
+                )
 
-        deps = []
-        for provider in providers:
-            for dep in provider.spec.deps__:
-                deps.append(dep)
+            providers.append(ProviderWithSpec(spec=spec, **provider.model_dump()))
 
-        for dep in deps:
-            if dep not in visited and dep in providers_with_specs:
-                dfs((dep, providers_with_specs[dep]), visited, stack)
+    return _topological_sort(providers)
 
-        stack.append(api_str)
 
+def _topological_sort(providers: list[ProviderWithSpec]) -> list[ProviderWithSpec]:
+    """Sort providers so dependencies are instantiated first."""
+    by_api: dict[str, ProviderWithSpec] = {p.spec.api.value: p for p in providers}
     visited: set[str] = set()
-    stack: list[str] = []
+    result: list[ProviderWithSpec] = []
 
-    for api_str, providers in providers_with_specs.items():
-        if api_str not in visited:
-            dfs((api_str, providers), visited, stack)
+    def visit(api_str: str) -> None:
+        if api_str in visited or api_str not in by_api:
+            return
+        visited.add(api_str)
+        provider = by_api[api_str]
+        for dep in provider.spec.api_dependencies:
+            visit(dep.value)
+        for dep in provider.spec.optional_api_dependencies:
+            visit(dep.value)
+        result.append(provider)
 
-    flattened = []
-    for api_str in stack:
-        for provider in providers_with_specs[api_str]:
-            flattened.append((api_str, provider))
+    for api_str in by_api:
+        visit(api_str)
 
-    return flattened
+    return result
 
 
-async def _instantiate_plugin_provider(
-    plugin_cls: type[ProviderPlugin],
+def _resolve_deps(provider: ProviderWithSpec, impls: dict[Api, Any]) -> dict[Api, Any]:
+    """Resolve required and optional dependencies for a provider."""
+    deps: dict[Api, Any] = {}
+    for api in provider.spec.api_dependencies:
+        if api not in impls:
+            raise RuntimeError(
+                f"Failed to resolve '{provider.spec.api.value}' provider '{provider.provider_id}': "
+                f"required dependency '{api.value}' is not available."
+            )
+        deps[api] = impls[api]
+    for api in provider.spec.optional_api_dependencies:
+        if api in impls:
+            deps[api] = impls[api]
+    return deps
+
+
+async def _instantiate_provider(
     provider: ProviderWithSpec,
     deps: dict[Api, Any],
     run_config: StackConfig,
 ) -> Any:
-    """Instantiate a provider via its ProviderPlugin subclass."""
+    """Instantiate a provider via its ProviderPlugin."""
+    plugin_cls = plugin_registry.get(provider.spec.provider_type)
+    if plugin_cls is None:
+        raise ValueError(
+            f"No ProviderPlugin registered for '{provider.spec.provider_type}'. "
+            f"All providers must be distributed as packages with a ProviderPlugin entry point."
+        )
+
     config = plugin_cls.config_class(**provider.config)
     plugin = plugin_cls(config)
-
-    logger.debug("Instantiating provider via plugin", provider_id=provider.provider_id, plugin=plugin_cls.__name__)
 
     dep_kwargs: dict[str, Any] = {}
     required_apis, optional_apis = plugin_cls.get_dependencies()
@@ -419,92 +282,43 @@ async def _instantiate_plugin_provider(
     return impl
 
 
-async def instantiate_provider(
-    provider: ProviderWithSpec,
-    deps: dict[Api, Any],
-    inner_impls: dict[str, Any],
-    dist_registry: DistributionRegistry,
+async def _wire_routing(
+    impls: dict[Api, Any],
+    dist_registry: Any,
     run_config: StackConfig,
     policy: list[AccessRule],
-):
-    """Instantiate a single provider, loading its module and verifying protocol compliance.
+) -> None:
+    """Wire up routing tables and auto-routers for routed APIs.
 
-    Args:
-        provider: The provider with its resolved spec.
-        deps: Resolved API dependencies for this provider.
-        inner_impls: Inner implementations for routing table providers.
-        dist_registry: The distribution registry for resource management.
-        run_config: The stack run configuration.
-        policy: Access control policy rules.
-
-    Returns:
-        The instantiated provider implementation.
+    This is infrastructure, not provider instantiation — routing tables and
+    routers are fixed implementations that delegate to the actual providers.
     """
-    provider_spec = provider.spec
+    from llama_stack.core.routers import get_auto_router_impl, get_routing_table_impl
 
-    # ProviderPlugin path: type-safe instantiation without string-based imports
-    plugin_cls = plugin_registry.get(provider_spec.provider_type)
-    if plugin_cls is not None:
-        return await _instantiate_plugin_provider(plugin_cls, provider, deps, run_config)
+    for info in builtin_automatically_routed_apis():
+        if info.router_api not in impls:
+            continue
 
-    # Legacy ProviderSpec path: string-based module/config_class imports
-    if not hasattr(provider_spec, "module") or provider_spec.module is None:
-        raise AttributeError(f"ProviderSpec of type {type(provider_spec)} does not have a 'module' attribute")
+        # Collect provider impls for this routed API
+        inner_impls = dict(_collect_provider_impls(impls, info.router_api))
 
-    logger.debug("Instantiating provider", provider_id=provider.provider_id, module=provider_spec.module)
-    module = importlib.import_module(provider_spec.module)
-    args = []
-    if isinstance(provider_spec, RemoteProviderSpec):
-        config_type = instantiate_class_type(provider_spec.config_class)
-        config = config_type(**provider.config)
+        # Build routing table (e.g., models, shields)
+        routing_table = await get_routing_table_impl(info.routing_table_api, inner_impls, impls, dist_registry, policy)
+        impls[info.routing_table_api] = routing_table
 
-        method = "get_adapter_impl"
-        args = [config, deps]
+        # Build auto-router (e.g., inference, safety)
+        str_deps = {api.value: impl for api, impl in impls.items()}
+        router = await get_auto_router_impl(info.router_api, routing_table, str_deps, run_config, policy)
+        impls[info.router_api] = router
 
-        if "policy" in inspect.signature(getattr(module, method)).parameters:
-            args.append(policy)
 
-    elif isinstance(provider_spec, AutoRoutedProviderSpec):
-        method = "get_auto_router_impl"
-
-        config = None
-        args = [provider_spec.api, deps[provider_spec.routing_table_api], deps, run_config, policy]
-    elif isinstance(provider_spec, RoutingTableProviderSpec):
-        method = "get_routing_table_impl"
-
-        config = None
-        args = [provider_spec.api, inner_impls, deps, dist_registry, policy]
-    else:
-        method = "get_provider_impl"
-        provider_config = provider.config.copy()
-
-        # Inject vector_stores_config for providers that need it (introspection-based)
-        config_type = instantiate_class_type(provider_spec.config_class)
-        if hasattr(config_type, "__fields__") and "vector_stores_config" in config_type.__fields__:
-            # Only inject if vector_stores is provided, otherwise let default_factory handle it
-            if run_config.vector_stores is not None:
-                provider_config["vector_stores_config"] = run_config.vector_stores
-
-        config = config_type(**provider_config)
-        args = [config, deps]
-        if "policy" in inspect.signature(getattr(module, method)).parameters:
-            args.append(policy)
-    fn = getattr(module, method)
-    impl = await fn(*args)
-    impl.__provider_id__ = provider.provider_id
-    impl.__provider_spec__ = provider_spec
-    impl.__provider_config__ = config
-
-    protocols = api_protocol_map_for_compliance_check(run_config)
-    additional_protocols = additional_protocols_map()
-    # TODO: check compliance for special tool groups
-    # the impl should be for Api.tool_runtime, the name should be the special tool group, the protocol should be the special tool group protocol
-    check_protocol_compliance(impl, protocols[provider_spec.api])
-    if not isinstance(provider_spec, AutoRoutedProviderSpec) and provider_spec.api in additional_protocols:
-        additional_api, _, _ = additional_protocols[provider_spec.api]
-        check_protocol_compliance(impl, additional_api)
-
-    return impl
+def _collect_provider_impls(impls: dict[Api, Any], api: Api) -> list[tuple[str, Any]]:
+    """Collect all provider implementations for a routed API."""
+    impl = impls.get(api)
+    if impl is None:
+        return []
+    provider_id = getattr(impl, "__provider_id__", api.value)
+    return [(provider_id, impl)]
 
 
 def check_protocol_compliance(obj: Any, protocol: Any) -> None:
