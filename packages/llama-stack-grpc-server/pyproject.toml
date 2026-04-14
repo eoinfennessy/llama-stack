@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+root = "../.."
+fallback_version = "0.7.1.dev0"
+
+[tool.uv.sources]
+llama-stack = { workspace = true }
+llama-stack-api = { workspace = true }
+
+[project]
+name = "llama-stack-grpc-server"
+dynamic = ["version"]
+description = "Base gRPC server for hosting Llama Stack providers as standalone gRPC services"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+    "llama-stack",
+    "llama-stack-api",
+    "grpcio>=1.60.0",
+    "protobuf>=4.25.0",
+    "PyYAML>=6.0",
+]
+
+[project.scripts]
+llama-stack-grpc-server = "llama_stack_grpc_server.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["llama_stack_grpc_server"]

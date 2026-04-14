@@ -231,6 +231,46 @@ def get_provider_registry(
             listing=listing,
         )
 
+        # Dynamically register grpc:: providers found in the run config
+        registry = _register_grpc_providers(registry, config)
+
+    return registry
+
+
+def _register_grpc_providers(
+    registry: dict[Api, dict[str, ProviderSpec]], config: StackConfig
+) -> dict[Api, dict[str, ProviderSpec]]:
+    """Dynamically register RemoteProviderSpec entries for any grpc:: provider types in the config.
+
+    This allows users to add ``grpc::<name>`` providers to their run config without
+    pre-registering them. All grpc:: providers share the same generic gRPC adapter
+    module and config class — the adapter doesn't care what provider is on the other end.
+    """
+    for api_str, providers in config.providers.items():
+        api = Api(api_str)
+        for provider in providers:
+            if not provider.provider_type.startswith("grpc::"):
+                continue
+            if provider.provider_type in registry.get(api, {}):
+                continue
+
+            name = provider.provider_type.removeprefix("grpc::")
+            spec = RemoteProviderSpec(
+                api=api,
+                adapter_type=f"grpc-{name}",
+                provider_type=provider.provider_type,
+                pip_packages=["grpcio"],
+                module="llama_stack.providers.grpc.inference",
+                config_class="llama_stack.providers.grpc.inference.config.GrpcInferenceConfig",
+                description=f"gRPC provider for {name}",
+            )
+            registry.setdefault(api, {})[provider.provider_type] = spec
+            logger.info(
+                "Dynamically registered gRPC provider",
+                provider_type=provider.provider_type,
+                api=api_str,
+            )
+
     return registry
 
 

@@ -74,6 +74,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+grpc = [
+    "grpcio>=1.60.0",
+    "grpcio-tools>=1.60.0",
+    "protobuf>=4.25.0",
+]
 client = [
     "llama-stack-client>=0.7.1", # Optional for library-only usage
 ]
@@ -368,6 +373,7 @@ convention = "google"
 "src/llama_stack/apis/**/__init__.py" = [
     "F403",
 ] # Using import * is acceptable (or at least tolerated) in an __init__.py of a package API
+"packages/llama-stack-grpc-server/src/llama_stack_grpc_server/servicers/**" = ["N802"] # gRPC servicers must match PascalCase RPC names
 
 [tool.mypy]
 mypy_path = ["src"]

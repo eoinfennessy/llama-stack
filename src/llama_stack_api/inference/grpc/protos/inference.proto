@@ -1,0 +1,34 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// All rights reserved.
+//
+// This source code is licensed under the terms described in the LICENSE file in
+// the root directory of this source tree.
+
+syntax = "proto3";
+
+package llama_stack.inference.v1;
+
+// InferenceService provides the gRPC wire protocol for Llama Stack inference
+// providers. Request and response bodies are JSON-serialized Pydantic models,
+// avoiding the need to maintain a parallel protobuf schema for the complex
+// OpenAI-compatible types.
+service InferenceService {
+  // Server-streaming RPCs. For non-streaming requests, the server sends a
+  // single response then closes the stream.
+  rpc Completion(InferenceRequest) returns (stream InferenceResponse);
+  rpc ChatCompletion(InferenceRequest) returns (stream InferenceResponse);
+
+  // Unary RPCs — these never stream.
+  rpc Embeddings(InferenceRequest) returns (InferenceResponse);
+  rpc Rerank(InferenceRequest) returns (InferenceResponse);
+}
+
+message InferenceRequest {
+  // JSON-serialized Pydantic request model (e.g. OpenAIChatCompletionRequestWithExtraBody).
+  string json_body = 1;
+}
+
+message InferenceResponse {
+  // JSON-serialized Pydantic response model (e.g. OpenAIChatCompletion or OpenAIChatCompletionChunk).
+  string json_body = 1;
+}

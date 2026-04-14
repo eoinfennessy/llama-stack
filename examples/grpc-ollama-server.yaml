@@ -1,0 +1,4 @@
+provider_type: remote::ollama
+port: 50051
+provider_config:
+  base_url: http://localhost:11434/v1

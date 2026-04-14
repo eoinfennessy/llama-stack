@@ -52,6 +52,8 @@ packages = [
     "llama_stack_api.files",
     "llama_stack_api.inspect_api",
     "llama_stack_api.inference",
+    "llama_stack_api.inference.grpc",
+    "llama_stack_api.inference.grpc.generated",
     "llama_stack_api.interactions",
     "llama_stack_api.internal",
     "llama_stack_api.messages",
@@ -91,6 +93,7 @@ fallback_version = "0.7.2.dev0"
 
 [tool.ruff]
 line-length = 120
+exclude = ["inference/grpc/generated"]
 
 [tool.ruff.lint]
 select = [
