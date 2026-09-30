@@ -9,9 +9,19 @@ import re
 from abc import abstractmethod
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, cast
+from urllib.parse import parse_qsl, urlsplit
 
-from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 from sqlalchemy.engine import URL
 
 from ogx.core.utils.config_dirs import DISTRIBS_BASE_DIR
@@ -35,6 +45,79 @@ class CommonConfig(BaseModel):
         default=None,
         description="All keys will be prefixed with this namespace",
     )
+
+
+_POSTGRES_COMPONENT_FIELDS = {"host", "port", "db", "user", "password"}
+_POSTGRES_SSL_QUERY_OPTIONS = {
+    "ssl",
+    "sslmode",
+    "sslrootcert",
+    "sslcert",
+    "sslkey",
+    "sslcrl",
+    "sslpassword",
+    "sslnegotiation",
+    "ssl_min_protocol_version",
+    "ssl_max_protocol_version",
+}
+
+
+def _is_env_var_expression(value: str) -> bool:
+    return value.startswith("${env.")
+
+
+def _parse_postgres_connection_string(connection_string: SecretStr) -> set[str]:
+    """Parse a PostgreSQL URI without exposing its credentials in validation errors."""
+    raw_connection_string = connection_string.get_secret_value()
+    if not raw_connection_string.startswith("postgresql://"):
+        raise ValueError("Failed to validate PostgreSQL connection_string: scheme must be 'postgresql://'")
+
+    try:
+        parsed = urlsplit(raw_connection_string)
+    except ValueError as exc:
+        raise ValueError("Failed to parse PostgreSQL connection_string") from exc
+
+    return {key for key, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+
+
+def _validate_postgres_connection_settings(
+    *,
+    connection_string: SecretStr | None,
+    user: str | None,
+    explicitly_set_fields: set[str],
+    ssl_mode: str | None,
+    ca_cert_path: str | Path | None,
+) -> None:
+    if connection_string is None:
+        if not user:
+            raise ValueError("Failed to configure PostgreSQL storage: provide connection_string or user")
+        return
+
+    conflicting_fields = sorted(_POSTGRES_COMPONENT_FIELDS & explicitly_set_fields)
+    if conflicting_fields:
+        raise ValueError(
+            "Failed to configure PostgreSQL storage with connection_string and component fields: "
+            f"{', '.join(conflicting_fields)}. Provide either connection_string or component fields."
+        )
+
+    raw_connection_string = connection_string.get_secret_value()
+    uri_ssl_options = (
+        _POSTGRES_SSL_QUERY_OPTIONS & _parse_postgres_connection_string(connection_string)
+        if not _is_env_var_expression(raw_connection_string)
+        else set()
+    )
+    if uri_ssl_options and (ssl_mode is not None or ca_cert_path is not None):
+        raise ValueError(
+            "Failed to configure PostgreSQL SSL in both connection_string and OGX fields "
+            f"(URI options: {', '.join(sorted(uri_ssl_options))})"
+        )
+
+
+def _validate_postgres_connection_string(connection_string: SecretStr | None) -> SecretStr | None:
+    # Config loaders resolve these expressions before creating a storage backend.
+    if connection_string is not None and not _is_env_var_expression(connection_string.get_secret_value()):
+        _parse_postgres_connection_string(connection_string)
+    return connection_string
 
 
 class RedisKVStoreConfig(CommonConfig):
@@ -76,11 +159,17 @@ class SqliteKVStoreConfig(CommonConfig):
 class PostgresKVStoreConfig(CommonConfig):
     """Configuration for the PostgreSQL key-value store backend."""
 
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     type: Literal[StorageBackendType.KV_POSTGRES] = StorageBackendType.KV_POSTGRES
+    connection_string: SecretStr | None = Field(
+        default=None,
+        description="PostgreSQL URI starting with postgresql://; use instead of host, port, db, user, and password.",
+    )
     host: str = "localhost"
     port: int | str = 5432
     db: str = "ogx"
-    user: str
+    user: str | None = None
     password: SecretStr | None = None
     ssl_mode: str | None = None
     ca_cert_path: str | None = None
@@ -89,15 +178,53 @@ class PostgresKVStoreConfig(CommonConfig):
     max_overflow: int = Field(default=10, ge=0, description="Max additional connections beyond pool_size")
     command_timeout: float = Field(default=30.0, gt=0, description="Timeout in seconds for individual SQL statements")
 
+    @field_validator("connection_string")
     @classmethod
-    def sample_run_config(cls, table_name: str = "ogx_kvstore", **kwargs: object) -> dict[str, str]:
+    def validate_connection_string(cls, value: SecretStr | None) -> SecretStr | None:
+        return _validate_postgres_connection_string(value)
+
+    @model_validator(mode="after")
+    def validate_connection_settings(self) -> "PostgresKVStoreConfig":
+        _validate_postgres_connection_settings(
+            connection_string=self.connection_string,
+            user=self.user,
+            explicitly_set_fields=self.model_fields_set,
+            ssl_mode=self.ssl_mode,
+            ca_cert_path=self.ca_cert_path,
+        )
+        return self
+
+    @model_serializer(mode="wrap")
+    def serialize_config(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = cast(dict[str, object], handler(self))
+        if self.connection_string is not None:
+            for field_name in _POSTGRES_COMPONENT_FIELDS:
+                data.pop(field_name, None)
+        return data
+
+    @classmethod
+    def sample_run_config(
+        cls,
+        table_name: str = "ogx_kvstore",
+        *,
+        use_connection_string: bool = False,
+        **kwargs: object,
+    ) -> dict[str, str]:
+        if use_connection_string:
+            connection_config = {
+                "connection_string": "${env.POSTGRES_CONNECTION_STRING:=postgresql://ogx:ogx@localhost:5432/ogx}"
+            }
+        else:
+            connection_config = {
+                "host": "${env.POSTGRES_HOST:=localhost}",
+                "port": "${env.POSTGRES_PORT:=5432}",
+                "db": "${env.POSTGRES_DB:=ogx}",
+                "user": "${env.POSTGRES_USER:=ogx}",
+                "password": "${env.POSTGRES_PASSWORD:=ogx}",
+            }
         return {
             "type": StorageBackendType.KV_POSTGRES.value,
-            "host": "${env.POSTGRES_HOST:=localhost}",
-            "port": "${env.POSTGRES_PORT:=5432}",
-            "db": "${env.POSTGRES_DB:=ogx}",
-            "user": "${env.POSTGRES_USER:=ogx}",
-            "password": "${env.POSTGRES_PASSWORD:=ogx}",
+            **connection_config,
             "table_name": "${env.POSTGRES_TABLE_NAME:=" + table_name + "}",
         }
 
@@ -175,11 +302,17 @@ class SqliteSqlStoreConfig(SqlAlchemySqlStoreConfig):
 class PostgresSqlStoreConfig(SqlAlchemySqlStoreConfig):
     """Configuration for the PostgreSQL SQL store backend."""
 
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     type: Literal[StorageBackendType.SQL_POSTGRES] = StorageBackendType.SQL_POSTGRES
+    connection_string: SecretStr | None = Field(
+        default=None,
+        description="PostgreSQL URI starting with postgresql://; use instead of host, port, db, user, and password.",
+    )
     host: str = "localhost"
     port: int | str = 5432
     db: str = "ogx"
-    user: str
+    user: str | None = None
     password: SecretStr | None = None
     ssl_mode: Literal["disable", "allow", "prefer", "require", "verify-ca", "verify-full"] | None = Field(
         default=None, description="PostgreSQL SSL mode (e.g. require, verify-full)"
@@ -189,8 +322,34 @@ class PostgresSqlStoreConfig(SqlAlchemySqlStoreConfig):
     max_overflow: int = Field(default=20, ge=0, description="Max additional connections beyond pool_size")
     pool_recycle: int = Field(default=3600, ge=-1, description="Connection recycle interval in seconds, -1 to disable")
 
+    @field_validator("connection_string")
+    @classmethod
+    def validate_connection_string(cls, value: SecretStr | None) -> SecretStr | None:
+        return _validate_postgres_connection_string(value)
+
+    @model_validator(mode="after")
+    def validate_connection_settings(self) -> "PostgresSqlStoreConfig":
+        _validate_postgres_connection_settings(
+            connection_string=self.connection_string,
+            user=self.user,
+            explicitly_set_fields=self.model_fields_set,
+            ssl_mode=self.ssl_mode,
+            ca_cert_path=self.ca_cert_path,
+        )
+        return self
+
+    @model_serializer(mode="wrap")
+    def serialize_config(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = cast(dict[str, object], handler(self))
+        if self.connection_string is not None:
+            for field_name in _POSTGRES_COMPONENT_FIELDS:
+                data.pop(field_name, None)
+        return data
+
     @property
     def engine_str(self) -> URL:
+        if self.connection_string is not None:
+            return URL.create(drivername="postgresql+asyncpg")
         return URL.create(
             drivername="postgresql+asyncpg",
             username=self.user,
@@ -201,14 +360,22 @@ class PostgresSqlStoreConfig(SqlAlchemySqlStoreConfig):
         )
 
     @classmethod
-    def sample_run_config(cls, **kwargs: object) -> dict[str, str]:
+    def sample_run_config(cls, *, use_connection_string: bool = False, **kwargs: object) -> dict[str, str]:
+        if use_connection_string:
+            connection_config = {
+                "connection_string": "${env.POSTGRES_CONNECTION_STRING:=postgresql://ogx:ogx@localhost:5432/ogx}"
+            }
+        else:
+            connection_config = {
+                "host": "${env.POSTGRES_HOST:=localhost}",
+                "port": "${env.POSTGRES_PORT:=5432}",
+                "db": "${env.POSTGRES_DB:=ogx}",
+                "user": "${env.POSTGRES_USER:=ogx}",
+                "password": "${env.POSTGRES_PASSWORD:=ogx}",
+            }
         return {
             "type": StorageBackendType.SQL_POSTGRES.value,
-            "host": "${env.POSTGRES_HOST:=localhost}",
-            "port": "${env.POSTGRES_PORT:=5432}",
-            "db": "${env.POSTGRES_DB:=ogx}",
-            "user": "${env.POSTGRES_USER:=ogx}",
-            "password": "${env.POSTGRES_PASSWORD:=ogx}",
+            **connection_config,
             "pool_size": "${env.POSTGRES_POOL_SIZE:=10}",
             "max_overflow": "${env.POSTGRES_MAX_OVERFLOW:=20}",
             "pool_recycle": "${env.POSTGRES_POOL_RECYCLE:=3600}",
@@ -357,6 +524,8 @@ def _default_backends() -> dict[str, StorageBackendConfig]:
 
 class StorageConfig(BaseModel):
     """Top-level storage configuration defining backends and store references."""
+
+    model_config = ConfigDict(hide_input_in_errors=True)
 
     # default_factory resolves SQLITE_STORE_DIR at construction time via
     # os.environ.get() instead of embedding literal ${env.SQLITE_STORE_DIR:=...}
