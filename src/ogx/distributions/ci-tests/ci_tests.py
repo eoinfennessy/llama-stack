@@ -6,7 +6,6 @@
 
 
 from ogx.core.datatypes import Provider
-from ogx.core.storage.datatypes import PostgresKVStoreConfig, PostgresSqlStoreConfig
 from ogx.distributions.template import DistributionTemplate
 from ogx.providers.remote.inference.llama_cpp_server.config import LlamaCppServerConfig
 from ogx.providers.remote.inference.text_embeddings_inference.config import TextEmbeddingsInferenceConfig
@@ -24,10 +23,6 @@ def get_distribution_template() -> DistributionTemplate:
     """
     template = get_starter_distribution_template(name="ci-tests")
     template.description = "CI tests for OGX"
-    template.run_configs["run-with-postgres-store.yaml"].storage_backends = {
-        "kv_default": PostgresKVStoreConfig.sample_run_config(),
-        "sql_default": PostgresSqlStoreConfig.sample_run_config(),
-    }
 
     # Pre-register a test MCP connector used by test_response_connector_resolution_mcp_tool.
     # The test starts an MCP server on port 5199 and references it by connector_id.
