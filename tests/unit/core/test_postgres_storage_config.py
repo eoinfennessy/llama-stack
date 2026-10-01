@@ -44,6 +44,20 @@ def test_connection_string_accepts_postgres_schemes(config_class: Any, scheme: s
 
 @pytest.mark.parametrize("config_class", POSTGRES_CONFIGS)
 @pytest.mark.parametrize(
+    "connection_string",
+    [
+        "postgresql://user:secret@",
+        "postgresql://user:secret@/app",
+        "postgresql://user:secret@db/",
+    ],
+)
+def test_connection_string_requires_host_and_database_path(config_class: Any, connection_string: str) -> None:
+    with pytest.raises(ValueError, match="host and database path"):
+        config_class(connection_string=connection_string)
+
+
+@pytest.mark.parametrize("config_class", POSTGRES_CONFIGS)
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         ("host", "localhost"),

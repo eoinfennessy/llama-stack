@@ -80,6 +80,11 @@ def _parse_postgres_connection_string(connection_string: SecretStr) -> set[str]:
     except ValueError as exc:
         raise ValueError("Failed to parse PostgreSQL connection_string") from exc
 
+    if not parsed.netloc or not parsed.hostname or not parsed.path.strip("/"):
+        raise ValueError(
+            "Failed to validate PostgreSQL connection_string: URI must include a host and database path"
+        )
+
     return {key for key, _ in parse_qsl(parsed.query, keep_blank_values=True)}
 
 
