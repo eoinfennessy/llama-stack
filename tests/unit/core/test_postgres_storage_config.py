@@ -26,11 +26,20 @@ _COMPONENT_FIELDS = {"host", "port", "db", "user", "password"}
 @pytest.mark.parametrize("config_class", POSTGRES_CONFIGS)
 @pytest.mark.parametrize(
     "connection_string",
-    ["postgres://user:secret@db/app", "postgresql+asyncpg://user:secret@db/app", "not-a-uri"],
+    ["postgresql+asyncpg://user:secret@db/app", "not-a-uri"],
 )
-def test_connection_string_requires_postgresql_scheme(config_class: Any, connection_string: str) -> None:
-    with pytest.raises(ValueError, match="postgresql://"):
+def test_connection_string_rejects_unsupported_scheme(config_class: Any, connection_string: str) -> None:
+    with pytest.raises(ValueError, match="postgres://.*postgresql://"):
         config_class(connection_string=connection_string)
+
+
+@pytest.mark.parametrize("config_class", POSTGRES_CONFIGS)
+@pytest.mark.parametrize("scheme", ["postgres://", "postgresql://"])
+def test_connection_string_accepts_postgres_schemes(config_class: Any, scheme: str) -> None:
+    config = config_class(connection_string=f"{scheme}user:secret@db/app")
+
+    assert config.connection_string is not None
+    assert config.connection_string.get_secret_value() == f"{scheme}user:secret@db/app"
 
 
 @pytest.mark.parametrize("config_class", POSTGRES_CONFIGS)

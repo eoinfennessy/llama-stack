@@ -48,6 +48,7 @@ class CommonConfig(BaseModel):
 
 
 _POSTGRES_COMPONENT_FIELDS = {"host", "port", "db", "user", "password"}
+_POSTGRES_URI_SCHEMES = ("postgres://", "postgresql://")
 _POSTGRES_SSL_QUERY_OPTIONS = {
     "ssl",
     "sslmode",
@@ -69,8 +70,10 @@ def _is_env_var_expression(value: str) -> bool:
 def _parse_postgres_connection_string(connection_string: SecretStr) -> set[str]:
     """Parse a PostgreSQL URI without exposing its credentials in validation errors."""
     raw_connection_string = connection_string.get_secret_value()
-    if not raw_connection_string.startswith("postgresql://"):
-        raise ValueError("Failed to validate PostgreSQL connection_string: scheme must be 'postgresql://'")
+    if not raw_connection_string.startswith(_POSTGRES_URI_SCHEMES):
+        raise ValueError(
+            "Failed to validate PostgreSQL connection_string: scheme must be 'postgres://' or 'postgresql://'"
+        )
 
     try:
         parsed = urlsplit(raw_connection_string)
@@ -164,7 +167,10 @@ class PostgresKVStoreConfig(CommonConfig):
     type: Literal[StorageBackendType.KV_POSTGRES] = StorageBackendType.KV_POSTGRES
     connection_string: SecretStr | None = Field(
         default=None,
-        description="PostgreSQL URI starting with postgresql://; use instead of host, port, db, user, and password.",
+        description=(
+            "PostgreSQL URI starting with postgres:// or postgresql://; "
+            "use instead of host, port, db, user, and password."
+        ),
     )
     host: str = "localhost"
     port: int | str = 5432
@@ -307,7 +313,10 @@ class PostgresSqlStoreConfig(SqlAlchemySqlStoreConfig):
     type: Literal[StorageBackendType.SQL_POSTGRES] = StorageBackendType.SQL_POSTGRES
     connection_string: SecretStr | None = Field(
         default=None,
-        description="PostgreSQL URI starting with postgresql://; use instead of host, port, db, user, and password.",
+        description=(
+            "PostgreSQL URI starting with postgres:// or postgresql://; "
+            "use instead of host, port, db, user, and password."
+        ),
     )
     host: str = "localhost"
     port: int | str = 5432
