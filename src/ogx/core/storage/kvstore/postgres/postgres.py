@@ -7,7 +7,7 @@
 import asyncio
 from collections.abc import Callable, Coroutine
 from datetime import datetime
-from typing import Any, TypeVar
+from typing import TypeVar
 
 import asyncpg  # type: ignore[import-untyped]
 
@@ -53,24 +53,26 @@ class PostgresKVStoreImpl(KVStore):
 
         if self._pool is None:
             try:
-                connection_options: dict[str, Any] = {
-                    "min_size": self.config.pool_size,
-                    "max_size": self.config.pool_size + self.config.max_overflow,
-                    "command_timeout": self.config.command_timeout,
-                }
                 if self.config.connection_string is not None:
-                    connection_options["dsn"] = self.config.connection_string.get_secret_value()
-                    connection_options["ssl"] = self._build_ssl()
+                    self._pool = await asyncpg.create_pool(
+                        dsn=self.config.connection_string.get_secret_value(),
+                        min_size=self.config.pool_size,
+                        max_size=self.config.pool_size + self.config.max_overflow,
+                        command_timeout=self.config.command_timeout,
+                        ssl=self._build_ssl(),
+                    )
                 else:
-                    connection_options.update(
+                    self._pool = await asyncpg.create_pool(
                         host=self.config.host,
                         port=int(self.config.port),
                         database=self.config.db,
                         user=self.config.user,
                         password=self.config.password.get_secret_value() if self.config.password else None,
+                        min_size=self.config.pool_size,
+                        max_size=self.config.pool_size + self.config.max_overflow,
+                        command_timeout=self.config.command_timeout,
                         ssl=self._build_ssl(),
                     )
-                self._pool = await asyncpg.create_pool(**connection_options)
                 self._loop = loop
             except Exception as e:
                 log.exception("Could not connect to PostgreSQL database server")
